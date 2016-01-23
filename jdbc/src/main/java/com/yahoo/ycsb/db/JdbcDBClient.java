@@ -24,8 +24,8 @@ import com.yahoo.ycsb.StringByteIterator;
 
 import java.sql.*;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+
+import org.apache.commons.lang.StringEscapeUtils;
 
 /**
  * A class that wraps a JDBC compliant database to allow it to be interfaced
@@ -55,6 +55,9 @@ public class JdbcDBClient extends DB {
   /** The password to use for establishing the connection. */
   public static final String CONNECTION_PASSWD = "db.passwd";
 
+  /** Whether CitusDB is used. */
+  public static final String CITUS_ENABLED = "citus";
+
   /** The JDBC fetch size hinted to the driver. */
   public static final String JDBC_FETCH_SIZE = "jdbc.fetchsize";
 
@@ -81,7 +84,7 @@ public class JdbcDBClient extends DB {
   private Properties props;
   private Integer jdbcFetchSize;
   private static final String DEFAULT_PROP = "";
-  private ConcurrentMap<StatementType, PreparedStatement> cachedStatements;
+  private boolean isCitus = false;
 
   /**
    * The statement type for the prepared statements.
@@ -212,6 +215,9 @@ public class JdbcDBClient extends DB {
     String autoCommitStr = props.getProperty(JDBC_AUTO_COMMIT, Boolean.TRUE.toString());
     Boolean autoCommit = Boolean.parseBoolean(autoCommitStr);
 
+    String isCitusStr = props.getProperty(CITUS_ENABLED, Boolean.FALSE.toString());
+    isCitus = Boolean.parseBoolean(isCitusStr);
+
     try {
       if (driver != null) {
         Class.forName(driver);
@@ -228,13 +234,17 @@ public class JdbcDBClient extends DB {
         // scan workload with fetchSize)
         conn.setAutoCommit(autoCommit);
 
+        if (isCitus) {
+          Statement stmt = conn.createStatement();
+          stmt.execute("SET citusdb.task_executor_type TO 'router'");
+        }
+
         shardCount++;
         conns.add(conn);
       }
 
       System.out.println("Using " + shardCount + " shards");
 
-      cachedStatements = new ConcurrentHashMap<StatementType, PreparedStatement>();
     } catch (ClassNotFoundException e) {
       System.err.println("Error in initializing the JDBS driver: " + e);
       throw new DBException(e);
@@ -258,104 +268,19 @@ public class JdbcDBClient extends DB {
     }
   }
 
-  private PreparedStatement createAndCacheInsertStatement(StatementType insertType, String key) throws SQLException {
-    StringBuilder insert = new StringBuilder("INSERT INTO ");
-    insert.append(insertType.tableName);
-    insert.append(" VALUES(?");
-    for (int i = 0; i < insertType.numFields; i++) {
-      insert.append(",?");
-    }
-    insert.append(")");
-    PreparedStatement insertStatement = getShardConnectionByKey(key).prepareStatement(insert.toString());
-    PreparedStatement stmt = cachedStatements.putIfAbsent(insertType, insertStatement);
-    if (stmt == null) {
-      return insertStatement;
-    }
-    return stmt;
-  }
-
-  private PreparedStatement createAndCacheReadStatement(StatementType readType, String key) throws SQLException {
-    StringBuilder read = new StringBuilder("SELECT * FROM ");
-    read.append(readType.tableName);
-    read.append(" WHERE ");
-    read.append(PRIMARY_KEY);
-    read.append(" = ");
-    read.append("?");
-    PreparedStatement readStatement = getShardConnectionByKey(key).prepareStatement(read.toString());
-    PreparedStatement stmt = cachedStatements.putIfAbsent(readType, readStatement);
-    if (stmt == null) {
-      return readStatement;
-    }
-    return stmt;
-  }
-
-  private PreparedStatement createAndCacheDeleteStatement(StatementType deleteType, String key) throws SQLException {
-    StringBuilder delete = new StringBuilder("DELETE FROM ");
-    delete.append(deleteType.tableName);
-    delete.append(" WHERE ");
-    delete.append(PRIMARY_KEY);
-    delete.append(" = ?");
-    PreparedStatement deleteStatement = getShardConnectionByKey(key).prepareStatement(delete.toString());
-    PreparedStatement stmt = cachedStatements.putIfAbsent(deleteType, deleteStatement);
-    if (stmt == null) {
-      return deleteStatement;
-    }
-    return stmt;
-  }
-
-  private PreparedStatement createAndCacheUpdateStatement(StatementType updateType, String key) throws SQLException {
-    StringBuilder update = new StringBuilder("UPDATE ");
-    update.append(updateType.tableName);
-    update.append(" SET ");
-    for (int i = 0; i < updateType.numFields; i++) {
-      update.append(COLUMN_PREFIX);
-      update.append(i);
-      update.append("=?");
-      if (i < updateType.numFields - 1) {
-        update.append(", ");
-      }
-    }
-    update.append(" WHERE ");
-    update.append(PRIMARY_KEY);
-    update.append(" = ?");
-    PreparedStatement insertStatement = getShardConnectionByKey(key).prepareStatement(update.toString());
-    PreparedStatement stmt = cachedStatements.putIfAbsent(updateType, insertStatement);
-    if (stmt == null) {
-      return insertStatement;
-    }
-    return stmt;
-  }
-
-  private PreparedStatement createAndCacheScanStatement(StatementType scanType, String key) throws SQLException {
-    StringBuilder select = new StringBuilder("SELECT * FROM ");
-    select.append(scanType.tableName);
-    select.append(" WHERE ");
-    select.append(PRIMARY_KEY);
-    select.append(" >= ?");
-    select.append(" ORDER BY ");
-    select.append(PRIMARY_KEY);
-    select.append(" LIMIT ?");
-    PreparedStatement scanStatement = getShardConnectionByKey(key).prepareStatement(select.toString());
-    if (this.jdbcFetchSize != null) {
-      scanStatement.setFetchSize(this.jdbcFetchSize);
-    }
-    PreparedStatement stmt = cachedStatements.putIfAbsent(scanType, scanStatement);
-    if (stmt == null) {
-      return scanStatement;
-    }
-    return stmt;
-  }
-
   @Override
   public Status read(String tableName, String key, Set<String> fields, HashMap<String, ByteIterator> result) {
     try {
-      StatementType type = new StatementType(StatementType.Type.READ, tableName, 1, getShardIndexByKey(key));
-      PreparedStatement readStatement = cachedStatements.get(type);
-      if (readStatement == null) {
-        readStatement = createAndCacheReadStatement(type, key);
-      }
-      readStatement.setString(1, key);
-      ResultSet resultSet = readStatement.executeQuery();
+      StringBuilder read = new StringBuilder("SELECT * FROM ");
+      read.append(tableName);
+      read.append(" WHERE ");
+      read.append(PRIMARY_KEY);
+      read.append(" = ");
+      read.append("'");
+      read.append(StringEscapeUtils.escapeSql(key));
+      read.append("'");
+      Statement readStatement = getShardConnectionByKey(key).createStatement();
+      ResultSet resultSet = readStatement.executeQuery(read.toString());
       if (!resultSet.next()) {
         resultSet.close();
         return Status.NOT_FOUND;
@@ -378,14 +303,26 @@ public class JdbcDBClient extends DB {
   public Status scan(String tableName, String startKey, int recordcount, Set<String> fields,
                      Vector<HashMap<String, ByteIterator>> result) {
     try {
-      StatementType type = new StatementType(StatementType.Type.SCAN, tableName, 1, getShardIndexByKey(startKey));
-      PreparedStatement scanStatement = cachedStatements.get(type);
-      if (scanStatement == null) {
-        scanStatement = createAndCacheScanStatement(type, startKey);
+      Connection connection = getShardConnectionByKey(startKey);
+
+      if (isCitus) {
+        Statement stmt = connection.createStatement();
+        stmt.execute("SET citusdb.task_executor_type TO 'real-time'");
       }
-      scanStatement.setString(1, startKey);
-      scanStatement.setInt(2, recordcount);
-      ResultSet resultSet = scanStatement.executeQuery();
+      StringBuilder select = new StringBuilder("SELECT * FROM ");
+      select.append(tableName);
+      select.append(" WHERE ");
+      select.append(PRIMARY_KEY);
+      select.append(" >= ");
+      select.append("'");
+      select.append(StringEscapeUtils.escapeSql(startKey));
+      select.append("'");
+      select.append(" ORDER BY ");
+      select.append(PRIMARY_KEY);
+      select.append(" LIMIT ");
+      select.append(recordcount);
+      Statement scanStatement = connection.createStatement();
+      ResultSet resultSet = scanStatement.executeQuery(select.toString());
       for (int i = 0; i < recordcount && resultSet.next(); i++) {
         if (result != null && fields != null) {
           HashMap<String, ByteIterator> values = new HashMap<String, ByteIterator>();
@@ -397,6 +334,10 @@ public class JdbcDBClient extends DB {
         }
       }
       resultSet.close();
+      if (isCitus) {
+        Statement stmt = connection.createStatement();
+        stmt.execute("SET citusdb.task_executor_type TO 'router'");
+      }
       return Status.OK;
     } catch (SQLException e) {
       System.err.println("Error in processing scan of table: " + tableName + e);
@@ -407,18 +348,32 @@ public class JdbcDBClient extends DB {
   @Override
   public Status update(String tableName, String key, HashMap<String, ByteIterator> values) {
     try {
-      int numFields = values.size();
-      StatementType type = new StatementType(StatementType.Type.UPDATE, tableName, numFields, getShardIndexByKey(key));
-      PreparedStatement updateStatement = cachedStatements.get(type);
-      if (updateStatement == null) {
-        updateStatement = createAndCacheUpdateStatement(type, key);
-      }
-      int index = 1;
+      int i =0;
+      StringBuilder update = new StringBuilder("UPDATE ");
+      update.append(tableName);
+      update.append(" SET ");
       for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
-        updateStatement.setString(index++, entry.getValue().toString());
+        String field = entry.getValue().toString();
+        if (i > 0) {
+          update.append(", ");
+        }
+        update.append(COLUMN_PREFIX);
+        update.append(i);
+        update.append("=");
+        update.append("'");
+        update.append(StringEscapeUtils.escapeSql(field));
+        update.append("'");
+        i++;
       }
-      updateStatement.setString(index, key);
-      int result = updateStatement.executeUpdate();
+      update.append(" WHERE ");
+      update.append(PRIMARY_KEY);
+      update.append(" = ");
+      update.append("'");
+      update.append(StringEscapeUtils.escapeSql(key));
+      update.append("'");
+
+      Statement updateStatement = getShardConnectionByKey(key).createStatement();
+      int result = updateStatement.executeUpdate(update.toString());
       if (result == 1) {
         return Status.OK;
       }
@@ -432,19 +387,22 @@ public class JdbcDBClient extends DB {
   @Override
   public Status insert(String tableName, String key, HashMap<String, ByteIterator> values) {
     try {
-      int numFields = values.size();
-      StatementType type = new StatementType(StatementType.Type.INSERT, tableName, numFields, getShardIndexByKey(key));
-      PreparedStatement insertStatement = cachedStatements.get(type);
-      if (insertStatement == null) {
-        insertStatement = createAndCacheInsertStatement(type, key);
-      }
-      insertStatement.setString(1, key);
-      int index = 2;
+      StringBuilder insert = new StringBuilder("INSERT INTO ");
+      insert.append(tableName);
+      insert.append(" VALUES(");
+      insert.append("'");
+      insert.append(StringEscapeUtils.escapeSql(key));
+      insert.append("'");
       for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
         String field = entry.getValue().toString();
-        insertStatement.setString(index++, field);
+        insert.append(",");
+        insert.append("'");
+        insert.append(StringEscapeUtils.escapeSql(field));
+        insert.append("'");
       }
-      int result = insertStatement.executeUpdate();
+      insert.append(")");
+      Statement insertStatement = getShardConnectionByKey(key).createStatement();
+      int result = insertStatement.executeUpdate(insert.toString());
       if (result == 1) {
         return Status.OK;
       }
@@ -458,13 +416,16 @@ public class JdbcDBClient extends DB {
   @Override
   public Status delete(String tableName, String key) {
     try {
-      StatementType type = new StatementType(StatementType.Type.DELETE, tableName, 1, getShardIndexByKey(key));
-      PreparedStatement deleteStatement = cachedStatements.get(type);
-      if (deleteStatement == null) {
-        deleteStatement = createAndCacheDeleteStatement(type, key);
-      }
-      deleteStatement.setString(1, key);
-      int result = deleteStatement.executeUpdate();
+      StringBuilder delete = new StringBuilder("DELETE FROM ");
+      delete.append(tableName);
+      delete.append(" WHERE ");
+      delete.append(PRIMARY_KEY);
+      delete.append(" = ");
+      delete.append("'");
+      delete.append(StringEscapeUtils.escapeSql(key));
+      delete.append("'");
+      Statement deleteStatement = getShardConnectionByKey(key).createStatement();
+      int result = deleteStatement.executeUpdate(delete.toString());
       if (result == 1) {
         return Status.OK;
       }
